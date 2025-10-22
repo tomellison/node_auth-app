@@ -1,3 +1,4 @@
+/* eslint-disable max-len */
 'use strict';
 
 const express = require('express');
@@ -10,7 +11,7 @@ const app = express();
 const users = [];
 
 // Email configuration
-const transporter = nodemailer.createTransport({
+const transporter = nodemailer.createTransporter({
   service: 'gmail',
   auth: {
     user: process.env.EMAIL,
@@ -22,8 +23,18 @@ const transporter = nodemailer.createTransport({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+const getToken = (req) => {
+  const authHeader = req.headers['authorization'];
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.split(' ')[1];
+  }
+
+  return null;
+};
+
 const authenticateToken = (req, res, next) => {
-  const token = req.headers['authorization'];
+  const token = getToken(req);
 
   if (!token) {
     return res.status(401).json({ error: 'Access denied' });
@@ -39,12 +50,18 @@ const authenticateToken = (req, res, next) => {
 };
 
 const isNotAuthenticated = (req, res, next) => {
-  const token = req.headers['authorization'];
+  const token = getToken(req);
 
   if (token) {
-    return res.status(400).json({ error: 'Already authenticated' });
+    jwt.verify(token, process.env.JWT_SECRET, (err) => {
+      if (!err) {
+        return res.status(400).json({ error: 'Already authenticated' });
+      }
+      next();
+    });
+  } else {
+    next();
   }
-  next();
 };
 
 // Password validation
@@ -68,7 +85,8 @@ const validatePassword = (password) => {
 app.post('/register', isNotAuthenticated, async (req, res) => {
   const { name, email, password } = req.body;
   const PASSWORD_ERROR =
-    'Password must be at least 8 characters and contain uppercase, lowercase, numbers and special characters'; // eslint-disable-line max-len
+    'Password must be at least 8 characters and contain uppercase, ' +
+    'lowercase, numbers and special characters';
 
   if (!validatePassword(password)) {
     return res.status(400).json({
@@ -98,11 +116,15 @@ app.post('/register', isNotAuthenticated, async (req, res) => {
   // Send activation email
   const activationLink = `${process.env.BASE_URL}/activate/${activationToken}`;
 
-  await transporter.sendMail({
-    to: email,
-    subject: 'Activate your account',
-    html: `Click <a href="${activationLink}">here</a> to activate your account`,
-  });
+  try {
+    await transporter.sendMail({
+      to: email,
+      subject: 'Activate your account',
+      html: `Click <a href="${activationLink}">here</a> to activate your account`,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to send activation email' });
+  }
 
   res.status(201).json({
     message:
@@ -122,7 +144,7 @@ app.get('/activate/:token', isNotAuthenticated, (req, res) => {
   user.active = true;
   user.activationToken = null;
 
-  res.redirect('/profile');
+  res.redirect('/login?activated=true');
 });
 
 // Login
@@ -140,14 +162,16 @@ app.post('/login', isNotAuthenticated, async (req, res) => {
       .json({ error: 'Please activate your account first' });
   }
 
-  const token = jwt.sign({ id: user.email }, process.env.JWT_SECRET);
+  const token = jwt.sign({ id: user.email }, process.env.JWT_SECRET, {
+    expiresIn: '24h',
+  });
 
-  res.json({ token });
+  res.json({ token, redirect: '/profile' });
 });
 
 // Logout
 app.post('/logout', authenticateToken, (req, res) => {
-  res.json({ message: 'Logged out successfully' });
+  res.json({ message: 'Logged out successfully', redirect: '/login' });
 });
 
 // Password reset request
@@ -166,11 +190,15 @@ app.post('/reset-password', isNotAuthenticated, async (req, res) => {
 
   const resetLink = `${process.env.BASE_URL}/reset-password/${resetToken}`;
 
-  await transporter.sendMail({
-    to: email,
-    subject: 'Reset your password',
-    html: `Click <a href="${resetLink}">here</a> to reset your password`,
-  });
+  try {
+    await transporter.sendMail({
+      to: email,
+      subject: 'Reset your password',
+      html: `Click <a href="${resetLink}">here</a> to reset your password`,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to send reset email' });
+  }
 
   res.json({ message: 'Password reset email sent' });
 });
@@ -200,12 +228,24 @@ app.post('/reset-password/:token', isNotAuthenticated, async (req, res) => {
   user.resetToken = null;
   user.resetTokenExpiry = null;
 
-  res.json({ message: 'Password reset successful' });
+  res.json({
+    message: 'Password reset successful',
+    redirect: '/reset-success',
+  });
+});
+
+// Reset success page
+app.get('/reset-success', (req, res) => {
+  res.json({ message: 'Password reset successful', loginLink: '/login' });
 });
 
 // Profile
 app.get('/profile', authenticateToken, (req, res) => {
   const user = users.find((u) => u.email === req.user.id);
+
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
 
   res.json({ name: user.name, email: user.email });
 });
@@ -213,15 +253,34 @@ app.get('/profile', authenticateToken, (req, res) => {
 // Update profile
 app.put('/profile', authenticateToken, async (req, res) => {
   const user = users.find((u) => u.email === req.user.id);
-  const { name, currentPassword, newPassword, newEmail } = req.body;
+  const {
+    name,
+    currentPassword,
+    newPassword,
+    confirmPassword,
+    newEmail,
+    confirmNewEmail,
+  } = req.body;
+
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  // Verify current password first if any sensitive changes
+  if (
+    (newPassword || newEmail) &&
+    !(await bcrypt.compare(currentPassword, user.password))
+  ) {
+    return res.status(401).json({ error: 'Current password is incorrect' });
+  }
 
   if (name) {
     user.name = name;
   }
 
   if (newPassword) {
-    if (!(await bcrypt.compare(currentPassword, user.password))) {
-      return res.status(401).json({ error: 'Current password is incorrect' });
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'New passwords do not match' });
     }
 
     if (!validatePassword(newPassword)) {
@@ -232,8 +291,8 @@ app.put('/profile', authenticateToken, async (req, res) => {
   }
 
   if (newEmail) {
-    if (!(await bcrypt.compare(currentPassword, user.password))) {
-      return res.status(401).json({ error: 'Current password is incorrect' });
+    if (newEmail !== confirmNewEmail) {
+      return res.status(400).json({ error: 'New emails do not match' });
     }
 
     const emailExists = users.find((u) => u.email === newEmail);
@@ -242,19 +301,74 @@ app.put('/profile', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Email already in use' });
     }
 
-    const oldEmail = user.email;
+    const emailChangeToken = uuidv4();
 
-    user.email = newEmail;
+    user.pendingEmail = newEmail;
+    user.emailChangeToken = emailChangeToken;
+    user.emailChangeExpiry = Date.now() + 3600000; // 1 hour
 
-    // Notify old email
-    await transporter.sendMail({
-      to: oldEmail,
-      subject: 'Email Changed',
-      text: `Your email has been changed to ${newEmail}`,
-    });
+    const confirmLink = `${process.env.BASE_URL}/confirm-email/${emailChangeToken}`;
+
+    try {
+      // Send confirmation to new email
+      await transporter.sendMail({
+        to: newEmail,
+        subject: 'Confirm Email Change',
+        html: `Click <a href="${confirmLink}">here</a> to confirm your new email`,
+      });
+
+      // Notify old email
+      await transporter.sendMail({
+        to: user.email,
+        subject: 'Email Change Request',
+        text: `A request to change your email to ${newEmail} was made. If this wasn't you, please secure your account.`,
+      });
+    } catch (error) {
+      return res
+        .status(500)
+        .json({ error: 'Failed to send confirmation email' });
+    }
+
+    return res.json({ message: 'Email confirmation sent to new address' });
   }
 
   res.json({ message: 'Profile updated successfully' });
+});
+
+// Email change confirmation
+app.get('/confirm-email/:token', authenticateToken, (req, res) => {
+  const { token } = req.params;
+  const user = users.find((u) => u.email === req.user.id);
+
+  if (
+    !user ||
+    user.emailChangeToken !== token ||
+    user.emailChangeExpiry < Date.now()
+  ) {
+    return res
+      .status(400)
+      .json({ error: 'Invalid or expired email change token' });
+  }
+
+  const oldEmail = user.email;
+
+  user.email = user.pendingEmail;
+  user.pendingEmail = null;
+  user.emailChangeToken = null;
+  user.emailChangeExpiry = null;
+
+  // Final notification to old email
+  try {
+    transporter.sendMail({
+      to: oldEmail,
+      subject: 'Email Changed Successfully',
+      text: `Your email has been successfully changed to ${user.email}`,
+    });
+  } catch (error) {
+    // Log error but don't fail the request
+  }
+
+  res.json({ message: 'Email changed successfully' });
 });
 
 // 404 handler
