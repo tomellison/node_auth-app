@@ -1,4 +1,3 @@
-/* eslint-disable max-len */
 'use strict';
 
 const express = require('express');
@@ -11,7 +10,7 @@ const app = express();
 const users = [];
 
 // Email configuration
-const transporter = nodemailer.createTransporter({
+const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
     user: process.env.EMAIL,
@@ -22,12 +21,17 @@ const transporter = nodemailer.createTransporter({
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(require('cookie-parser')());
 
 const getToken = (req) => {
-  const authHeader = req.headers['authorization'];
+  const authHeader = req.headers.authorization;
 
   if (authHeader && authHeader.startsWith('Bearer ')) {
     return authHeader.split(' ')[1];
+  }
+
+  if (req.cookies && req.cookies.token) {
+    return req.cookies.token;
   }
 
   return null;
@@ -84,14 +88,12 @@ const validatePassword = (password) => {
 // Registration
 app.post('/register', isNotAuthenticated, async (req, res) => {
   const { name, email, password } = req.body;
-  const PASSWORD_ERROR =
-    'Password must be at least 8 characters and contain uppercase, ' +
-    'lowercase, numbers and special characters';
+  const passwordError =
+    'Password must be at least 8 characters and contain ' +
+    'uppercase, lowercase, numbers and special characters';
 
   if (!validatePassword(password)) {
-    return res.status(400).json({
-      error: PASSWORD_ERROR,
-    });
+    return res.status(400).json({ error: passwordError });
   }
 
   const userExists = users.find((u) => u.email === email);
@@ -113,22 +115,20 @@ app.post('/register', isNotAuthenticated, async (req, res) => {
 
   users.push(newUser);
 
-  // Send activation email
   const activationLink = `${process.env.BASE_URL}/activate/${activationToken}`;
 
   try {
     await transporter.sendMail({
       to: email,
       subject: 'Activate your account',
-      html: `Click <a href="${activationLink}">here</a> to activate your account`,
+      html: `Click <a href="${activationLink}">here</a> to activate`,
     });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to send activation email' });
   }
 
   res.status(201).json({
-    message:
-      'Registration successful. Please check your email to activate account.',
+    message: 'Registration successful. Check your email to activate account.',
   });
 });
 
@@ -144,7 +144,18 @@ app.get('/activate/:token', isNotAuthenticated, (req, res) => {
   user.active = true;
   user.activationToken = null;
 
-  res.redirect('/login?activated=true');
+  const jwtToken = jwt.sign({ id: user.email }, process.env.JWT_SECRET, {
+    expiresIn: '24h',
+  });
+
+  res.cookie('token', jwtToken, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    maxAge: 24 * 60 * 60 * 1000,
+  });
+
+  res.redirect('/profile');
 });
 
 // Login
@@ -166,12 +177,24 @@ app.post('/login', isNotAuthenticated, async (req, res) => {
     expiresIn: '24h',
   });
 
-  res.json({ token, redirect: '/profile' });
+  res.cookie('token', token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    maxAge: 24 * 60 * 60 * 1000,
+  });
+
+  res.redirect('/profile');
 });
 
 // Logout
 app.post('/logout', authenticateToken, (req, res) => {
-  res.json({ message: 'Logged out successfully', redirect: '/login' });
+  res.clearCookie('token', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+  });
+  res.redirect('/login');
 });
 
 // Password reset request
@@ -186,7 +209,7 @@ app.post('/reset-password', isNotAuthenticated, async (req, res) => {
   const resetToken = uuidv4();
 
   user.resetToken = resetToken;
-  user.resetTokenExpiry = Date.now() + 3600000; // 1 hour
+  user.resetTokenExpiry = Date.now() + 3600000;
 
   const resetLink = `${process.env.BASE_URL}/reset-password/${resetToken}`;
 
@@ -266,11 +289,10 @@ app.put('/profile', authenticateToken, async (req, res) => {
     return res.status(404).json({ error: 'User not found' });
   }
 
-  // Verify current password first if any sensitive changes
-  if (
-    (newPassword || newEmail) &&
-    !(await bcrypt.compare(currentPassword, user.password))
-  ) {
+  const needsPasswordCheck = newPassword || newEmail;
+  const isPasswordValid = await bcrypt.compare(currentPassword, user.password);
+
+  if (needsPasswordCheck && !isPasswordValid) {
     return res.status(401).json({ error: 'Current password is incorrect' });
   }
 
@@ -305,23 +327,25 @@ app.put('/profile', authenticateToken, async (req, res) => {
 
     user.pendingEmail = newEmail;
     user.emailChangeToken = emailChangeToken;
-    user.emailChangeExpiry = Date.now() + 3600000; // 1 hour
+    user.emailChangeExpiry = Date.now() + 3600000;
 
     const confirmLink = `${process.env.BASE_URL}/confirm-email/${emailChangeToken}`;
 
     try {
-      // Send confirmation to new email
       await transporter.sendMail({
         to: newEmail,
         subject: 'Confirm Email Change',
-        html: `Click <a href="${confirmLink}">here</a> to confirm your new email`,
+        html: `Click <a href="${confirmLink}">here</a> to confirm`,
       });
 
-      // Notify old email
+      const notificationText =
+        `A request to change your email to ${newEmail} ` +
+        "was made. If this wasn't you, please secure your account.";
+
       await transporter.sendMail({
         to: user.email,
         subject: 'Email Change Request',
-        text: `A request to change your email to ${newEmail} was made. If this wasn't you, please secure your account.`,
+        text: notificationText,
       });
     } catch (error) {
       return res
@@ -336,15 +360,13 @@ app.put('/profile', authenticateToken, async (req, res) => {
 });
 
 // Email change confirmation
-app.get('/confirm-email/:token', authenticateToken, (req, res) => {
+app.get('/confirm-email/:token', (req, res) => {
   const { token } = req.params;
-  const user = users.find((u) => u.email === req.user.id);
+  const user = users.find(
+    (u) => u.emailChangeToken === token && u.emailChangeExpiry > Date.now(),
+  );
 
-  if (
-    !user ||
-    user.emailChangeToken !== token ||
-    user.emailChangeExpiry < Date.now()
-  ) {
+  if (!user) {
     return res
       .status(400)
       .json({ error: 'Invalid or expired email change token' });
@@ -357,16 +379,18 @@ app.get('/confirm-email/:token', authenticateToken, (req, res) => {
   user.emailChangeToken = null;
   user.emailChangeExpiry = null;
 
-  // Final notification to old email
-  try {
-    transporter.sendMail({
-      to: oldEmail,
-      subject: 'Email Changed Successfully',
-      text: `Your email has been successfully changed to ${user.email}`,
-    });
-  } catch (error) {
-    // Log error but don't fail the request
-  }
+  (async () => {
+    try {
+      await transporter.sendMail({
+        to: oldEmail,
+        subject: 'Email Changed Successfully',
+        text: `Your email has been successfully changed to ${user.email}`,
+      });
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error('Failed to send email change notification:', error);
+    }
+  })();
 
   res.json({ message: 'Email changed successfully' });
 });
